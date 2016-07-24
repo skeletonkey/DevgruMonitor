@@ -44,6 +44,9 @@ needs to be provided.
         node_name => {
             end_point => 'http://url.to/end/point/that/is/used/to/monitor/node',
         },
+        node_name2 => {
+            template_vars => [qw(a b)],
+        },
     },
     type => 'node_type',
     up_frequency => 300, # seconds between checking a node that was last seen as upon
@@ -52,6 +55,8 @@ needs to be provided.
     version_frequency => 86400, # seconds between version checks - 0 means don't check
     severity_thresholds => [ 25 ], # percentages of down threshold - used by severity method
     check_timeout => 5, # connection timeout in seconds for deteriming the state of a node
+    base_template => 'http://%s.%s.com', # a base url incase you need to hit other part of it
+    end_point_template => '%s/end_point',
   );
 
 =cut
@@ -60,18 +65,25 @@ sub new {
     my $package = shift;
     my $class = ref($package) || $package;
 
-    my $self = {@_};
-    if ($self->{type}) {
-        $class .= '::' . delete $self->{type};
+    my $args = {@_};
+    if ($args->{type}) {
+        $class .= '::' . delete $args->{type};
         eval "require $class";
         croak("Unable to find correct monitoring class ($class): $@") if $@;
     }
     else {
         croak("No type provided");
     }
+
+    my $self = bless($args, $class);
+
     if ($self->{node_data}) {
         my $node_data = delete $self->{node_data};
         foreach my $node_name (keys %$node_data) {
+            if (!$node_data->{$node_name}{end_point}) {
+                $node_data->{$node_name}{end_point}
+                    = $self->build_template(@{$node_data->{$node_name}{template_vars}});
+            }
             $self->{_nodes}{$node_name} = Devgru::Node->new(%{$node_data->{$node_name}}, name => $node_name);
         }
     }
@@ -80,42 +92,201 @@ sub new {
     }
     if (! exists $self->{up_frequency}) {
         carp("No up_frequency provided! Using default value: 300 seconds");
-        $self->{up_frequency} = 300;
+        $self->up_frequency(300);
     }
+    else {
+        $self->up_frequency($self->{up_frequency})
+    }
+
     if (! exists $self->{down_frequency}) {
         carp("No down_frequency provided! Using default value: 60 seconds");
-        $self->{down_frequency} = 60;
+        $self->down_frequency(60);
     }
+    else {
+        $self->down_frequency($self->{down_frequency})
+    }
+
     if (! exists $self->{version_frequency}) {
         carp("No version_frequency provided! Using default value: 0 seconds - it will not check for versions");
-        $self->{version_frequency} = 0;
+        $self->version_frequency(0);
     }
+    else {
+        $self->version_frequency($self->{version_frequency})
+    }
+
     if (! exists $self->{severity_thresholds}) {
         carp("No severity thresholds provided! Using default value of an empty array");
-        $self->{severity_thresholds} = [];
+        $self->severity_thresholds([]);
     }
+    else {
+        $self->severity_thresholds($self->{severity_thresholds});
+    }
+
     if (! exists $self->{check_timeout}) {
         carp("No check_timeout provided! Using default value: 5 seconds");
-        $self->{check_timeout} = 5;
+        $self->check_timeout(5);
     }
+    else {
+        $self->check_timeout($self->{check_timeout});
+    }
+
     if (! exists $self->{down_confirm_count}) {
         carp("No down_confirm_count provided! Using default value: 0");
-        $self->{down_confirm_count} = 0;
+        $self->down_confirm_count(0);
+    }
+    else {
+        $self->down_confirm_count($self->{down_confirm_count});
     }
 
-    $self->{last_version_check} = 0;
 
-    return bless($self, $class);
+    $self->last_version_check(0);
+
+    return $self;
 }
 
-sub get_check_timeout       { return shift->{check_timeout};       }
-sub get_down_confirm_count  { return shift->{down_confirm_count};  }
-sub get_down_frequency      { return shift->{down_frequency};      }
-sub get_severity_thresholds { return shift->{severity_thresholds}; }
-sub get_url_template        { return shift->{url_template};        }
-sub get_up_frequency        { return shift->{up_frequency};        }
-sub get_version_frequency   { return shift->{version_frequency};   }
+=head2 check_timeout
 
+connection timeout in seconds for deteriming the state of a node
+
+=cut
+sub check_timeout { 
+    my $self = shift;
+
+    if (@_) {
+        my $new_value = shift;
+        croak "check_timeout needs to be an integer" unless $new_value =~ /^\d+$/;
+        $self->{check_timeout} = $new_value;
+    }
+    return $self->{check_timeout};
+}
+
+=head2 down_confirm_count
+
+how many down report before we actually consider it down
+
+=cut
+sub down_confirm_count { 
+    my $self = shift;
+
+    if (@_) {
+        my $new_value = shift;
+        croak "down_confirm_count needs to be an integer" unless $new_value =~ /^\d+$/;
+        $self->{down_confirm_count} = $new_value;
+    }
+    return $self->{down_confirm_count};
+}
+
+=head2 down_frequency
+
+seconds between checking a node that was last seen as down
+
+=cut
+sub down_frequency { 
+    my $self = shift;
+
+    if (@_) {
+        my $new_value = shift;
+        croak "down_frequency needs to be an integer" unless $new_value =~ /^\d+$/;
+        $self->{down_frequency} = $new_value;
+    }
+    return $self->{down_frequency};
+}
+
+=head2 severity_thresholds
+
+percentages of down threshold - used by severity method
+
+This is an array reference of integers
+
+=cut
+sub severity_thresholds {
+    my $self = shift;
+
+    if (@_) {
+        my $args = ref $_[0] eq 'ARRAY' ? $_[0] : [@_];
+
+        foreach (@$args) {
+            croak("Severity Thresholds need to be integers") unless /^\d+$/;
+        }
+
+        $self->{severity_thresholds} = $args;
+    }
+
+    return $self->{severity_thresholds};
+}
+
+=head2 base_template
+
+The 'base' url for the particular node.  This will be used by the end_point_template
+if it is present.
+
+The use case is if you need to hit other end_points on other the node for other information.
+
+It is read only.
+
+=cut
+sub base_template {
+    my $self = shift;
+
+    croak("base_template can only be provided with the new call") if @_;
+
+    return $self->{base_template};
+}
+
+=head2 end_point_template
+
+Template that is used in conjunction with the Node's template_vars to create 
+the actual end_point url.
+
+It is read only;
+
+=cut
+sub end_point_template        {
+    my $self = shift;
+
+    croak("end_point_template can only be provided with the new call") if @_;
+
+    return $self->{end_point_template};
+}
+
+=head2 up_frequency
+
+seconds between checking a node that was last seen as upon
+
+=cut
+sub up_frequency { 
+    my $self = shift;
+
+    if (@_) {
+        my $new_value = shift;
+        croak "up_frequency needs to be an integer" unless $new_value =~ /^\d+$/;
+        $self->{up_frequency} = $new_value;
+    }
+    return $self->{up_frequency};
+}
+
+=head2 version_frequency
+
+seconds between version checks - 0 means don't check
+
+=cut
+sub version_frequency { 
+    my $self = shift;
+
+    if (@_) {
+        my $new_value = shift;
+        croak "version_frequency needs to be an integer" unless $new_value =~ /^\d+$/;
+        $self->{version_frequency} = $new_value;
+    }
+    return $self->{version_frequency};
+}
+
+=head2
+
+last_version_check should be 0 or the last time the versions on all the nodes
+where checked (to create a report) in epoch seconds
+
+=cut
 sub last_version_check {
     my $self = shift;
 
@@ -147,6 +318,9 @@ It returns the following:
 -1 - server is up but degraded
 0  - server is NOT up
 
+If asked for an array to be returned a boolean (1|0) is returned indicating if
+this status is new (or fresh) or from cache.
+
 =over 2
 
 =item node_name
@@ -164,16 +338,18 @@ sub is_node_up {
     my $node = $self->get_node($node_name);
 
     my $last_check = $node->last_check;
+    my $fresh_reading = 0;
     if (
         !$last_check
-        || ($node->status == $self->SERVER_UP && (time - $last_check > $self->get_up_frequency))
-        || (time - $last_check > $self->get_down_frequency)
+        || ($node->status == $self->SERVER_UP && (time - $last_check > $self->up_frequency))
+        || (time - $last_check > $self->down_frequency)
        ) {
-        $node->last_check(time);
         $self->_check_node($node_name);
+        $node->last_check(time);
+        $fresh_reading = 1;
     }
 
-    return $node->status;
+    return wantarray ? ($node->status, $fresh_reading) : $node->status;
 }
 
 =head2 _check_node
@@ -212,7 +388,7 @@ return of get_down_node_names
 sub percent_nodes_down {
     my $self = shift;
 
-    return scalar($self->get_down_node_names) / scalar($self->get_node_names) * 100;
+    return int(scalar($self->get_down_node_names) / scalar($self->get_node_names) * 100);
 }
 
 =head get_down_node_names
@@ -233,7 +409,7 @@ sub get_down_node_names {
         my $node = $self->get_node($node_name);
         push(@names, $node_name)
             if $node->status ne SERVER_UP
-                && $node->down_count >= $self->get_down_confirm_count;
+                && $node->down_count >= $self->down_confirm_count;
     }
 
     return @names;;
@@ -273,7 +449,7 @@ sub severity {
 
     my $down_percent = $self->percent_nodes_down;
 
-    foreach my $threshold (sort { $a <=> $b } @{$self->get_severity_thresholds}) {
+    foreach my $threshold (sort { $a <=> $b } @{$self->severity_thresholds}) {
 
         if ($threshold <= $down_percent) {
             $severity++;
@@ -286,26 +462,44 @@ sub severity {
     return $severity;
 }
 
-=head2 build_url
-
-Use this to combine the url_template with it's template_vars.
+=head2 build_base_template
 
 =cut
-sub build_url {
+sub build_base_template {
     my $self = shift;
-    my $node_name = shift || croak('No node_name provided to build_url');
+    my @args = @_;
+    @args = @{$args[0]} if ref($args[0]) eq 'ARRAY';
 
-    croak('No url_template found') unless $self->get_url_template;
+    croak('No url/template args provied to build_base_template') unless @args;
 
-    my $node = $self->get_node($node_name);
+    croak('No base_template found') unless $self->base_template;
 
-    croak('No node found') unless $node;
-    croak('No template_vars found for node ' . $node_name) unless $node->template_vars;
-
-    return sprintf($self->get_url_template, @{$node->template_vars});
+    return sprintf($self->base_template, @args);
 }
 
+=head2 build_template
 
+Use this to combine the end_point_template with it's template_vars.
+
+It will use base_template if it has been specified.
+
+=cut
+sub build_template {
+    my $self = shift;
+    my @args = @_;
+    @args = @{$args[0]} if ref($args[0]) eq 'ARRAY';
+
+    croak('No url/template args provied to build_template') unless @args;
+
+    croak('No end_point_template found') unless $self->end_point_template;
+
+    my $end_point = $self->end_point_template;
+
+    $end_point = sprintf($end_point, $self->base_template)
+        if $self->base_template;
+
+    return sprintf($end_point, @args);
+}
 
 =head1 AUTHOR
 
